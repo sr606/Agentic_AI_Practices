@@ -1,0 +1,333 @@
+The implementation adds a reusable OpenTelemetry tracing layer across the MCP server so every tool request can be followed in Jaeger in a way that is readable to both technical and business audiences.
+
+At a high level, the flow now looks like this:
+
+A request enters FastAPI.
+FastAPI creates the top-level HTTP/server span.
+The router creates a business-readable MCP tool span such as mcp.tool.get_tables_schema.
+The router adds safe input/output summaries like database name, table count, row count, warnings count, file name, or artifact size.
+The backend tool creates deeper child spans for actual work such as DB connect, SQL execution, CSV parse, model validation, script assembly, or file write.
+All spans share the same active context, so Jaeger shows them as one trace tree.
+That gives you both:
+
+an operational view: latency, failures, bottlenecks
+a business view: which tool ran, for which session, what step of the workflow it represented, and what kind of result it produced
+What Was Added
+
+In tracing.py, I expanded the tracing utility into the shared foundation for the whole implementation.
+
+Functions added or formalized there:
+
+setup_tracing(app=None)
+Why: initializes the OTEL provider once, configures OTLP export, and instruments FastAPI so incoming requests automatically create spans.
+
+shutdown_tracing()
+Why: flushes and shuts down the tracer cleanly during app shutdown so traces are not lost.
+
+safe_preview(value, limit=160)
+Why: lets us capture a short preview of large or sensitive inputs like SQL, JSON, or code without storing the full payload in traces.
+
+safe_basename(path)
+Why: records only the filename instead of the full path when that is enough for observability and safer for demos.
+
+set_span_attribute_if_present(...)
+Why: normalizes different value types before storing them as span attributes.
+
+set_span_attributes(...)
+Why: a reusable batch helper so every file sets attributes the same way.
+
+add_span_event(...)
+Why: gives us a standard way to add point-in-time events inside spans.
+
+record_input_output(...)
+Why: this is one of the most important reusable helpers. It standardizes how router spans attach safe input and output summaries using input.* and output.* keys.
+
+start_span(name, attributes=None)
+Why: this is the generic reusable context manager for creating child spans anywhere in the codebase.
+
+start_mcp_tool_span(...)
+Why: this is the main MCP-specific reusable wrapper. It creates a consistently named tool span and automatically tags it with:
+
+mcp.tool.name
+mcp.agent_session_id
+mcp.router
+business.domain
+business.step
+This file is the part we will keep using repeatedly across the repo. It is intentionally generic so other routers or services can adopt the same pattern.
+
+Why tracing.py Is the Most Reusable Part
+
+If you need to explain this to others, this is the best classification:
+
+Platform-level helpers:
+setup_tracing, shutdown_tracing
+These are app-lifecycle functions.
+
+Safe observability helpers:
+safe_preview, safe_basename, record_input_output
+These are for making traces useful without exposing too much raw data.
+
+Span utility helpers:
+set_span_attribute_if_present, set_span_attributes, add_span_event
+These remove repeated boilerplate.
+
+Core tracing wrappers:
+start_span, start_mcp_tool_span
+These are the reusable patterns that make the implementation consistent everywhere.
+
+If the repo grows, these are exactly the functions we should keep reusing instead of each team writing tracing differently.
+
+What Changed In App Startup
+
+In main.py, I added tracing initialization and shutdown wiring.
+
+What was added:
+
+import of setup_tracing and shutdown_tracing
+call to setup_tracing(app) right after app creation
+shutdown hook that calls shutdown_tracing()
+Why it was added:
+
+without setup_tracing(app), the tracer helper existed but FastAPI itself was not instrumented
+this means earlier you would not automatically get request-level spans
+now every request entering the MCP server starts with a proper HTTP/server span, and all child spans hang below it
+This is important because the routers and backend tools need a parent trace context to create a readable span tree in Jaeger.
+
+What Changed In Dependencies
+
+In requirements.txt, I added:
+
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-grpc
+opentelemetry-instrumentation-fastapi
+Why:
+
+sdk gives the actual tracer provider and span processor
+otlp exporter sends spans to your collector or Jaeger pipeline
+fastapi instrumentation creates request spans automatically
+Without these, the code would compile but tracing would not actually work end-to-end.
+
+What Changed In The Router Layer
+
+The router files are where we translated “technical requests” into “business-readable workflow steps”.
+
+Files changed:
+
+database_mcp.py
+datavault_mcp.py
+transformer_mcp.py
+What was added in each endpoint:
+
+a start_mcp_tool_span(...) wrapper
+standardized metadata like tool name, router name, business domain, and business step
+input summaries before calling the tool
+output summaries after receiving the tool result
+Why this layer matters:
+
+the backend tool layer knows how to do the work
+the router layer knows what the work means in the MCP product/workflow
+so the router is the right place to label spans in business-friendly language
+Examples:
+
+get_all_databases is labeled as discover_databases
+get_postgres_tables is labeled as discover_tables
+get_tables_schema is labeled as fetch_table_schema
+validate_dv_model is labeled as validate_model
+compile_dv_ddl is labeled as compile_ddl
+assemble_pyspark_script is labeled as assemble_script
+That is what makes the trace understandable to someone who is not reading Python code.
+
+Why Input/Output Summaries Were Added
+
+This is another part worth explaining clearly to others.
+
+We did not want raw tracing that dumps entire payloads into Jaeger, because that creates noise and risk. Instead, the router spans store summaries.
+
+Examples of input summaries:
+
+database name
+schema name
+table count
+query preview
+JSON length
+code length
+file name
+output filename
+Examples of output summaries:
+
+row count
+number of databases
+number of tables
+number of columns
+number of warnings
+number of snippets
+bytes written
+saved path basename
+Why:
+
+enough detail to explain what happened
+not so much detail that traces become cluttered or unsafe
+better for demos and business review sessions
+What Changed In The Backend Tool Layer
+
+Files changed:
+
+database.py
+datavault.py
+transformer.py
+This layer already had some basic span attribute usage through otel_trace.get_current_span(), but it did not create structured child spans for the actual units of work. I added those.
+
+Database Tool Classification
+
+In database.py, the tracing is now organized around real DB work steps.
+
+Reusable tracing patterns added:
+
+db.connect
+db.query.list_databases
+db.query.list_tables
+db.query.table_schema
+db.query.execute
+db.query.fetch_results
+db.query.commit
+db.query.table_constraints
+Why:
+
+lets you see whether latency comes from connection setup, query execution, result fetching, or commit
+gives a much more useful performance picture than one big “tool ran” span
+This is especially valuable for tools like:
+
+run_postgres_query
+get_tables_schema
+get_tables_constraints
+These can vary significantly in runtime, so splitting the work is important.
+
+DataVault Tool Classification
+
+In datavault.py, I added spans around the logical phases of the DV pipeline.
+
+Reusable tracing patterns added:
+
+datavault.read_csv_schema
+datavault.csv.parse
+datavault.validate_dv_model
+datavault.json.parse
+datavault.model.repair_validate
+datavault.compile_dv_ddl
+datavault.ddl.compile
+datavault.validate_dv_sql
+datavault.sql.cross_check
+datavault.save_dv_artifact
+datavault.file.write
+Why:
+
+the Data Vault flow is a multi-step business process, not just a utility call
+users need to understand where they are in the pipeline
+Jaeger should show “read -> validate -> compile -> cross-check -> save” as distinct stages
+This makes the trace feel like a workflow rather than a blob of Python execution.
+
+Transformer Tool Classification
+
+In transformer.py, I added spans around the transformation pipeline steps.
+
+Reusable tracing patterns added:
+
+transformer.read_transformer_csv
+transformer.csv.parse
+transformer.validate_pyspark_code
+transformer.syntax_check
+transformer.save_transformer_artifact
+transformer.file.write
+transformer.store_transformation_snippet
+transformer.snippet.write
+transformer.assemble_pyspark_script
+transformer.snippets.load
+transformer.script.compose
+Why:
+
+the transformer flow is naturally staged
+script generation is easier to explain when broken into read, store, assemble, validate, and save
+this also helps when debugging long or complex generated scripts
+How To Explain The Overall Design To Others
+
+A simple way to explain it is:
+
+“We added tracing at three levels.”
+
+Level 1: infrastructure
+FastAPI request tracing starts automatically when a request enters the MCP server.
+
+Level 2: business tool tracing
+Every MCP endpoint creates a clearly named tool span with workflow labels like discover_tables, compile_ddl, or assemble_script.
+
+Level 3: execution tracing
+The backend implementation creates child spans for actual work such as connecting to the database, parsing a CSV, compiling DDL, or writing files.
+
+That explanation usually lands well because it separates:
+
+transport
+business action
+technical execution
+Why This Structure Is Better Than Only Logging
+
+Before this, logs could tell you that a tool ran or failed. Now traces can tell you:
+
+what request started the work
+which MCP tool handled it
+what business step that tool represented
+how long each part took
+where the slowdown happened
+what the result roughly looked like
+Logs are still useful for details. Traces are better for flow, timing, and business explainability.
+
+Why The Naming Matters
+
+A big part of this implementation is naming spans intentionally.
+
+We avoided generic names like:
+
+process_data
+run_tool
+handle_request
+Instead we used names that explain the workflow:
+
+mcp.tool.get_tables_schema
+database.get_tables_schema
+datavault.compile_dv_ddl
+transformer.assemble_pyspark_script
+And we added business.domain and business.step.
+
+Why:
+
+when someone opens Jaeger, they should understand the flow without opening the code
+span names should read like the product behavior
+What We Intentionally Did Not Do Yet
+
+We did not yet instrument mcp_config.py.
+
+Why that was deferred:
+
+phase 1 focuses on the MCP server and backend tools
+this already gives very strong visibility inside the tool server
+adding caller-side propagation later will extend traces further upstream into tool loading and agent orchestration
+So right now the implementation is “strong server-side tracing first.”
+
+The Most Reusable Patterns Going Forward
+
+If more tools are added later, the pattern to repeat is:
+
+In the router:
+wrap endpoint logic with start_mcp_tool_span(...)
+add record_input_output(...)
+
+In the backend tool:
+wrap meaningful work blocks with start_span(...)
+add set_span_attributes(...) on useful outcomes
+
+That is the implementation pattern we should keep using again and again across the repo.
+
+Short Summary You Can Reuse Verbally
+
+“We introduced a shared OTEL tracing utility, enabled FastAPI tracing at startup, added business-readable spans at every MCP endpoint, and added deeper child spans inside the database, Data Vault, and transformer tool implementations. The result is a clean trace hierarchy in Jaeger that shows request flow, tool intent, execution steps, and summarized outcomes without dumping full sensitive payloads.”
+
+If you want, I can turn this into a cleaner handoff document in markdown inside the repo, like mcp_server/OTEL_TRACING_REPORT.md
